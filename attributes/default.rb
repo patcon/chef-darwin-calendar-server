@@ -1,0 +1,7 @@
+default['darwin']['user']            = "darwin"
+default['darwin']['hostname']        = "flock-sync.whispersystems.org"
+default['darwin']['home_dir']        = "/home/#{default['darwin']['user']}"
+default['darwin']['install_dir']     = "#{default['darwin']['home_dir']}/CalendarServer"
+default['darwin']['server_root']     = "#{default['darwin']['install_dir']}/data"
+default['darwin']['config_file']     = "#{default['darwin']['install_dir']}/conf/caldavd.plist"
+default['darwin']['caldavd_options'] = "-f #{default['darwin']['config_file']}"

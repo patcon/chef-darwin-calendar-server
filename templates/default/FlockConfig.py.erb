@@ -1,0 +1,7 @@
+DATABASE_DSN     = "<%= node['postgres-accounts']['host'] %>:<%= node['postgres-accounts']['database'] %>:<%= node['postgres-accounts']['darwin_user'] %>:<%= node['postgres-accounts']['darwin_password'] %>::"
+STATSD_HOST      = "<%= node['statsd']['host'] %>"
+STATSD_PORT      = 8125
+PATH_CONFIG_FILE = "<%= node['darwin']['config_file'] %>"
+S3_BUCKET_NAME   = "<%= node['s3fs']['bucket'] %>"
+S3_ACCESS_KEY    = "<%= node['s3fs']['access_key_id'] %>"
+S3_SECRET_KEY    = "<%= node['s3fs']['secret_access_key'] %>"

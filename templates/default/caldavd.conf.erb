@@ -1,0 +1,8 @@
+description "Darwin Calendar Server"
+author  "rhodey orbits <rhodey@anhonesteffort.org>"
+
+start on runlevel [234]
+stop on runlevel [0156]
+
+chdir <%= node['darwin']['install_dir'] %>
+exec <%= node['darwin']['install_dir'] %>/bin/caldavd <%= node['darwin']['caldavd_options'] %>
