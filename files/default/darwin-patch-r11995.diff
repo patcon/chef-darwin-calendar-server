@@ -1,0 +1,1266 @@
+diff --git calendarserver/tap/util.py calendarserver/tap/util.py
+index abb8367..aa8dcfa 100644
+--- calendarserver/tap/util.py
++++ calendarserver/tap/util.py
+@@ -581,7 +581,7 @@ def getRootResource(config, newStore, resources=None):
+                         principalCollections=(principalCollection,),
+                         isdir=False,
+                         defaultACL=SimpleResource.allReadACL,
+-                        scheme=scheme, port=port, path=redirected_to)
++                        scheme="https", port="443", path=redirected_to)
+                 )
+ 
+     for alias in config.Aliases:
+@@ -714,6 +714,10 @@ def getRootResource(config, newStore, resources=None):
+     log.info("Configuring authentication wrapper")
+ 
+     overrides = {}
++    ## User registration API
++    #from twistedcaldav.directory.principal_api import PrincipalCollectionsRESTResource
++    #resources.append(("api", PrincipalCollectionsRESTResource, (None, ), ["basic"]))
++
+     if resources:
+         for path, cls, args, schemes in resources:
+ 
+diff --git support/build.sh support/build.sh
+index 179734d..6036bd6 100644
+--- support/build.sh
++++ support/build.sh
+@@ -667,38 +667,6 @@ dependencies () {
+     init_py;
+   fi;
+ 
+-  if type -P memcached > /dev/null; then
+-    using_system "memcached";
+-  else
+-    local le="libevent-2.0.17-stable";
+-    local mc="memcached-1.4.13";
+-    c_dependency -m "dad64aaaaff16b5fbec25160c06fee9a" \
+-      "libevent" "${le}" \
+-      "https://github.com/downloads/libevent/libevent/${le}.tar.gz";
+-    c_dependency -m "6d18c6d25da945442fcc1187b3b63b7f" \
+-      "memcached" "${mc}" \
+-      "http://memcached.googlecode.com/files/${mc}.tar.gz";
+-  fi;
+-
+-  if type -P postgres > /dev/null; then
+-    using_system "Postgres";
+-  else
+-    local pgv="9.2.4";
+-    local pg="postgresql-${pgv}";
+-
+-    if type -P dtrace > /dev/null; then
+-      local enable_dtrace="--enable-dtrace";
+-    else
+-      local enable_dtrace="";
+-    fi;
+-
+-    c_dependency -m "52df0a9e288f02d7e6e0af89ed4dcfc6" \
+-      "PostgreSQL" "${pg}" \
+-      "ftp://ftp5.us.postgresql.org/pub/PostgreSQL/source/v${pgv}/${pg}.tar.gz" \
+-      --with-python ${enable_dtrace};
+-    :;
+-  fi;
+-
+   if find_header ldap.h; then
+     using_system "OpenLDAP";
+   else
+@@ -881,9 +849,6 @@ dependencies () {
+     "${n}" "${n}" "${p}" \
+     "${pypi}/p/${n}/${p}.tar.gz";
+ 
+-  svn_get "CalDAVTester" "${top}/CalDAVTester" \
+-      "${svn_uri_base}/CalDAVTester/trunk" HEAD;
+-
+   local v="3.0.1";
+   local n="epydoc";
+   local p="${n}-${v}";
+diff --git twistedcaldav/directory/securesync/FlockConfig.py twistedcaldav/directory/securesync/FlockConfig.py
+new file mode 100644
+index 0000000..2106329
+--- /dev/null
++++ twistedcaldav/directory/securesync/FlockConfig.py
+@@ -0,0 +1,7 @@
++DATABASE_DSN     = "127.0.0.1:accounts:darwin:darwinpass::"
++STATSD_HOST      = "localhost"
++STATSD_PORT      = 8125
++PATH_CONFIG_FILE = "/home/rhodey/dev/SecureSync/darwin/conf/caldavd-dev.plist"
++S3_ACCESS_KEY    = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
++S3_SECRET_KEY    = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
++S3_BUCKET_NAME   = "bucket-name"
+diff --git twistedcaldav/directory/securesync/PsqlDirectoryService.py twistedcaldav/directory/securesync/PsqlDirectoryService.py
+new file mode 100644
+index 0000000..d3d890f
+--- /dev/null
++++ twistedcaldav/directory/securesync/PsqlDirectoryService.py
+@@ -0,0 +1,231 @@
++__all__ = [
++    "PsqlDirectoryService",
++]
++
++import FlockConfig
++
++import urllib
++import statsd
++from twistedcaldav.config              import config
++from twistedcaldav.directory.directory import DirectoryService, DirectoryError
++from twext.python.memcacheclient       import ClientFactory, MemcacheError
++from txdav.base.datastore.dbapiclient  import DBAPIConnector, postgresPreflight
++
++from twistedcaldav.directory.securesync.providers.CursorAccountFactory import CursorAccountFactory
++
++TABLE_ACCOUNTS = "account_expire_helper"
++METRIC_NAME    = "twistedcaldav.directory.securesync.PsqlDirectoryService"
++
++
++class PsqlDirectoryService(DirectoryService):
++
++    PRINCIPAL_TYPE_FLOCK_ACCOUNT = "users"
++    PRINCIPAL_TYPE_FLOCK_GROUP   = "groups"
++
++    KEY_ACCOUNTS_ALL = "darwin_account_expire_helper_all"
++
++    baseGUID = "00031337-1337-1337-1337-313370313370" # a special number, no really read the spec 0.o.
++
++    def __repr__(self):
++        return "%s" % (self.__class__.__name__)
++
++    def __init__(self, params):
++        defaults = {
++            'cacheTimeout'         : 1,
++            'negativeCaching'      : False,
++            'recordTypes'          : (
++                self.PRINCIPAL_TYPE_FLOCK_ACCOUNT,
++                self.PRINCIPAL_TYPE_FLOCK_GROUP
++            ),
++            'realmName'            : "Darwin Calendar Server",
++            'augmentService'       : None,
++            'groupMembershipCache' : None
++        }
++        ignored = None
++        params  = self.getParams(params, defaults, ignored)
++
++        self._recordTypes         = defaults['recordTypes']
++        self.realmName            = params['realmName']
++        self.augmentService       = params['augmentService']
++        self.groupMembershipCache = params['groupMembershipCache']
++        self.cacheTimeout         = params['cacheTimeout'] * 60
++
++        self._statsd_connection          = statsd.Connection(host=FlockConfig.STATSD_HOST, port=FlockConfig.STATSD_PORT)
++        self._counterDbErrorCount        = statsd.Counter(METRIC_NAME + '.database-error-count',       self._statsd_connection)
++        self._counterCacheHits           = statsd.Counter(METRIC_NAME + '.memcached-hit-count',        self._statsd_connection)
++        self._counterCacheMisses         = statsd.Counter(METRIC_NAME + '.memcached-miss-count',       self._statsd_connection)
++        self._counterCacheErrorCount     = statsd.Counter(METRIC_NAME + '.memcached-error-count',      self._statsd_connection)
++        self._counterCacheSetRetryCount  = statsd.Counter(METRIC_NAME + '.memcached-set-retry-count',  self._statsd_connection)
++        self._counterCacheSetFailedCount = statsd.Counter(METRIC_NAME + '.memcached-set-failed-count', self._statsd_connection)
++
++        super(PsqlDirectoryService, self).__init__()
++
++    def _getPsqlConnection(self, refresh=False):
++        import pgdb
++
++        if refresh or not hasattr(self, "_psqlConnection"):
++            try:
++                self._psqlConnection = DBAPIConnector(pgdb, postgresPreflight, FlockConfig.DATABASE_DSN).connect()
++                return self._psqlConnection
++
++            except Exception, e:
++                del self._psqlConnection
++                self._counterDbErrorCount += 1
++                raise DirectoryError("Failed to connect to database: %s" % e)
++
++        return self._psqlConnection
++
++    def _getMemcacheClient(self, refresh=False):
++        if refresh or not hasattr(self, "memcacheClient"):
++            self._memcachedClient = ClientFactory.getClient(['%s:%s' %
++                                    (config.Memcached.Pools.Default.BindAddress, config.Memcached.Pools.Default.Port)],
++                                    debug=0, pickleProtocol=2)
++
++        return self._memcachedClient
++
++    def _memcacheSet(self, key, record):
++        timerMemcachedSet = statsd.Timer(METRIC_NAME + '.memcached-set-timer', self._statsd_connection)
++        timerMemcachedSet.start()
++
++        try:
++            if not self._getMemcacheClient().set(key, record, time=3600):
++                self._counterCacheSetRetryCount += 1
++                self.log.error("Could not write to memcache, retrying.")
++                if not self._getMemcacheClient(refresh=True).set(key, record, time=3600):
++                    del self._memcachedClient
++                    self._counterCacheSetFailedCount += 1
++                    self.log.error("Could not write to memcache again, giving up.")
++
++        except MemcacheError:
++            del self._memcachedClient
++            self._counterCacheErrorCount += 1
++            self.log.error("Memcache error, will try new connection next time.")
++
++        timerMemcachedSet.stop()
++
++    def _memcacheGet(self, key):
++        timerMemcachedGet = statsd.Timer(METRIC_NAME + '.memcached-get-timer', self._statsd_connection)
++        timerMemcachedGet.start()
++
++        try:
++            record = self._getMemcacheClient().get(key)
++            timerMemcachedGet.stop()
++            return record
++
++        except MemcacheError:
++            del self._memcachedClient
++            self._counterCacheErrorCount += 1
++            self.log.error("Could not read from memcache, deleting client.")
++
++        timerMemcachedGet.stop()
++
++    def _getAccountKey(self, accountId):
++        return TABLE_ACCOUNTS + "_" + accountId
++
++    def _getPrincipals(self):
++        timerGetPrincipals = statsd.Timer(METRIC_NAME + '.getPrincipals-timer', self._statsd_connection)
++        timerGetPrincipals.start()
++
++        principals = {}
++
++        accountRows  = self._memcacheGet(self.KEY_ACCOUNTS_ALL)
++        accounts     = CursorAccountFactory.accountsFromRows(self, accountRows)
++
++        if accounts is None:
++            self._counterCacheMisses += 1
++            cursor = self._getPsqlConnection().cursor()
++            try:
++                cursor.execute(CursorAccountFactory.getQueryForAccounts())
++                accountRows = cursor.fetchall()
++                accounts    = CursorAccountFactory.accountsFromRows(self, accountRows)
++                self._memcacheSet(self.KEY_ACCOUNTS_ALL, accountRows)
++
++            except Exception, e:
++                self._getPsqlConnection(refresh=True)
++                self._counterDbErrorCount += 1
++                raise DirectoryError("Error querying account tables: %s" % e)
++
++            finally:
++                cursor.close()
++        else:
++            self._counterCacheHits += 1
++
++        principals[self.PRINCIPAL_TYPE_FLOCK_ACCOUNT] = accounts
++        principals[self.PRINCIPAL_TYPE_FLOCK_GROUP  ] = []
++
++        timerGetPrincipals.stop()
++        return principals
++
++    def recordWithShortName(self, recordType, shortName):
++        timerRecordWithShortName = statsd.Timer(METRIC_NAME + '.recordWithShortName-timer', self._statsd_connection)
++        timerRecordWithShortName.start()
++
++        if recordType == self.PRINCIPAL_TYPE_FLOCK_ACCOUNT:
++            shortName = urllib.unquote(shortName.upper())
++            if shortName.endswith("@V2"):
++                shortName = shortName[:-3]
++
++            accountRow = self._memcacheGet(self._getAccountKey(shortName))
++            account    = CursorAccountFactory.accountFromRow(self, accountRow)
++
++            if account is None:
++                self._counterCacheMisses += 1
++                cursor = self._getPsqlConnection().cursor()
++                try:
++                    cursor.execute(CursorAccountFactory.getQueryForAccount(shortName))
++                    accountRow = cursor.realCursor.fetchone()
++                    account    = CursorAccountFactory.accountFromRow(self, accountRow)
++                    if accountRow is not None:
++                        self.log.error("ID >> %s, DAYS_EXPIRED >> %d" % (accountRow[0], accountRow[4]))
++                    self._memcacheSet(self._getAccountKey(shortName), accountRow)
++
++                except Exception, e:
++                    self._getPsqlConnection(refresh=True)
++                    self._counterDbErrorCount += 1
++                    raise DirectoryError("Error querying account tables: %s" % e)
++
++                finally:
++                    cursor.close()
++            else:
++                self._counterCacheHits += 1
++
++            timerRecordWithShortName.stop()
++            return account
++
++        elif recordType == self.PRINCIPAL_TYPE_FLOCK_GROUP:
++            timerRecordWithShortName.stop()
++            return None
++
++        else:
++            timerRecordWithShortName.stop()
++            raise DirectoryError("Illegal record type: " + recordType)
++
++    def recordWithGUID(self, guid):
++        return self.recordWithShortName(self.PRINCIPAL_TYPE_FLOCK_ACCOUNT, guid)
++
++    def recordTypes(self):
++        return self._recordTypes
++
++    def listRecords(self, recordType):
++        if recordType not in self._recordTypes:
++            raise DirectoryError("Illegal record type: " + recordType)
++
++        return self._getPrincipals()[recordType]
++
++    def createRecord(self, recordType, guid=None, shortNames=(), authIDs=set(),
++        fullName=None, firstName=None, lastName=None, emailAddresses=set(),
++        uid=None, password=None, **kwargs):
++        raise NotImplementedError("not going to happen.")
++
++    def updateRecord(self, recordType, guid=None, shortNames=(), authIDs=set(),
++        fullName=None, firstName=None, lastName=None, emailAddresses=set(),
++        uid=None, password=None, **kwargs):
++        raise NotImplementedError("not going to happen.")
++
++    def destroyRecord(self, recordType, guid=None):
++        raise NotImplementedError("not going to happen.")
++
++    def createRecords(self, data):
++        raise NotImplementedError("not going to happen.")
++
++    recordWithUID = recordWithGUID
+diff --git twistedcaldav/directory/securesync/__init__.py twistedcaldav/directory/securesync/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git twistedcaldav/directory/securesync/model/FlockAccount.py twistedcaldav/directory/securesync/model/FlockAccount.py
+new file mode 100644
+index 0000000..65ea8ce
+--- /dev/null
++++ twistedcaldav/directory/securesync/model/FlockAccount.py
+@@ -0,0 +1,75 @@
++__author__ = 'rhodey'
++
++import urllib
++import hashlib
++import base64
++
++from twistedcaldav.directory.directory import DirectoryRecord, DirectoryError
++from twisted.cred.credentials          import UsernamePassword
++from twext.web2.http                   import HTTPError
++from twext.web2                        import responsecode
++
++class FlockAccount(DirectoryRecord):
++
++    def __init__(self, service, id, version, salt, passwordSha512, isExpired):
++        self._accountId      = id
++        self._version        = version
++        self._salt           = salt
++        self._passwordSha512 = passwordSha512
++        self._isExpired      = isExpired
++        self._memberships    = []
++
++        super(FlockAccount, self).__init__(
++            service=service,
++            recordType="users",
++            guid=id,
++            uid=id,
++            shortNames=(id, ),
++            fullName=id,
++            firstName=id,
++            lastName=id,
++            emailAddresses=[],
++            enabledForCalendaring=True,
++            enabledForAddressBooks=True
++        )
++        self.enabled = True
++
++    def members(self):
++        return []
++
++    def groups(self):
++        for groupId in self._memberships:
++            yield self.service.recordWithShortName("groups", groupId)
++
++    def memberGUIDs(self):
++        return []
++
++    def verifyCredentials(self, credentials):
++        if not isinstance(credentials, UsernamePassword):
++            raise DirectoryError("Authentication method not supported, HTTP Basic Auth only!")
++
++        username           = urllib.unquote(credentials.username.upper())
++        clientIsVersionOne = True
++
++        if username.endswith("@V2"):
++            username           = username[:-3]
++            clientIsVersionOne = False
++
++        if username != self._accountId:
++            return False
++
++        sha512 = hashlib.sha512()
++        sha512.update(self._salt + credentials.password)
++        theirHashedPassword  = sha512.digest()
++        theirEncodedPassword = base64.b64encode(theirHashedPassword)
++
++        if theirEncodedPassword == self._passwordSha512:
++            if self._version > 1 and clientIsVersionOne:
++                raise HTTPError(responsecode.HTTP_VERSION_NOT_SUPPORTED)
++
++            if self._isExpired is False:
++                return True
++
++            raise HTTPError(responsecode.PAYMENT_REQUIRED)
++
++        return False
+\ No newline at end of file
+diff --git twistedcaldav/directory/securesync/model/__init__.py twistedcaldav/directory/securesync/model/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git twistedcaldav/directory/securesync/providers/CursorAccountFactory.py twistedcaldav/directory/securesync/providers/CursorAccountFactory.py
+new file mode 100644
+index 0000000..6c9ea25
+--- /dev/null
++++ twistedcaldav/directory/securesync/providers/CursorAccountFactory.py
+@@ -0,0 +1,57 @@
++__author__ = 'rhodey'
++
++import time
++from twistedcaldav.directory.securesync.model.FlockAccount import FlockAccount
++
++KEY_ID              = 0
++KEY_VERSION         = 1
++KEY_SALT            = 2
++KEY_PASSWORD_SHA512 = 3
++KEY_DAYS_EXPIRED    = 4
++
++class CursorAccountFactory(object):
++
++    @staticmethod
++    def getQueryForAccount(accountId):
++        return "SELECT id, version, salt, password_sha512, days_expired FROM  \
++                    (SELECT id, version, salt, password_sha512, (1 + CAST('" + time.strftime("%Y-%m-%d") + "' AS DATE) - account.date_create) - \
++                        CASE \
++                            WHEN days_credit > 0 THEN days_credit \
++                            ELSE 0 \
++                        END \
++                    AS days_expired FROM account LEFT JOIN \
++                        (SELECT id_account, CAST(SUM(days_credit) AS INTEGER) AS days_credit FROM subscription GROUP BY id_account) \
++                    AS subscriptions ON id_account = id) \
++                AS account_expire_helper WHERE id = '%s'" % accountId
++
++    @staticmethod
++    def accountFromRow(service, row):
++        try:
++            return FlockAccount(service, row[KEY_ID], row[KEY_VERSION], row[KEY_SALT], row[KEY_PASSWORD_SHA512], (row[KEY_DAYS_EXPIRED] > 0))
++
++        except:
++            return None
++
++    @staticmethod
++    def getQueryForAccounts():
++        return "SELECT id, version, salt, password_sha512, days_expired FROM  \
++                    (SELECT id, version, salt, password_sha512, (1 + CAST('" + time.strftime("%Y-%m-%d") + "' AS DATE) - account.date_create) - \
++                        CASE \
++                            WHEN days_credit > 0 THEN days_credit \
++                            ELSE 0 \
++                        END \
++                    AS days_expired FROM account LEFT JOIN \
++                        (SELECT id_account, CAST(SUM(days_credit) AS INTEGER) AS days_credit FROM subscription GROUP BY id_account) \
++                    AS subscriptions ON id_account = id) \
++                AS account_expire_helper"
++
++    @staticmethod
++    def accountsFromRows(service, rows):
++        accounts = []
++        try:
++            for row in rows:
++                accounts.append(FlockAccount(service, row[KEY_ID], row[KEY_VERSION], row[KEY_SALT], row[KEY_PASSWORD_SHA512], (row[KEY_DAYS_EXPIRED] > 0)))
++            return accounts
++
++        except:
++            return None
+diff --git twistedcaldav/directory/securesync/providers/__init__.py twistedcaldav/directory/securesync/providers/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git twistedcaldav/stdconfig.py twistedcaldav/stdconfig.py
+index 65a0ac6..b5284b1 100644
+--- twistedcaldav/stdconfig.py
++++ twistedcaldav/stdconfig.py
+@@ -344,11 +344,17 @@ DEFAULT_CONFIG = {
+ 
+     # Resource data
+     "MaxCollectionsPerHome"     : 50, # Maximum number of calendars/address books allowed in a home
+-    "MaxResourcesPerCollection" : 10000, # Maximum number of resources in a calendar/address book
++    "MaxPropertiesPerResource"  : 20, # Maximum properties per resource
++    "MaxPropertySize"           : 500, # Maximum property size (in bytes)
++    "MaxResourcesPerCollection" : 10000, # Maximum number of resources in a calendar
++    "MaxContactsPerAddressbook" : 10000, # Maximum number of resources in a address book
+     "MaxResourceSize"           : 1048576, # Maximum resource size (in bytes)
+     "MaxAttendeesPerInstance"   : 100, # Maximum number of unique attendees
+     "MaxAllowedInstances"       : 3000, # Maximum number of instances the server will index
+ 
++    "ContactPhotoRoot" : "./contact-photos", # Root directory for contact photos
++    "MaxPhotoSize"     : 1048576,            # Maximum photo size (in bytes)
++
+     # Set to URL path of wiki authentication service, e.g. "/auth", in order
+     # to use javascript authentication dialog.  Empty string indicates standard
+     # browser authentication dialog should be used.
+diff --git twistedcaldav/storebridge.py twistedcaldav/storebridge.py
+index 726fe2c..b800221 100644
+--- twistedcaldav/storebridge.py
++++ twistedcaldav/storebridge.py
+@@ -3377,6 +3377,31 @@ class AddressBookObjectResource(_CommonObjectResource):
+         returnValue(response)
+ 
+ 
++    def _handleRaiseIfInvalid(self, component):
++        if config.MaxResourceSize:
++            if component.hasProperty("PHOTO"):
++                vcardsize = len(str(component)) - len(component.propertyValue("PHOTO"))
++            else:
++                vcardsize = len(str(component))
++
++            if vcardsize > config.MaxResourceSize:
++                self.log.error("vcard exceeds maximum resource size")
++                raise HTTPError(ErrorResponse(
++                    responsecode.REQUEST_ENTITY_TOO_LARGE,
++                    (carddav_namespace, "valid-address-data"),
++                    description="vcard exceeds maximum resource size"
++                ))
++
++        if config.MaxPhotoSize and component.hasProperty("PHOTO"):
++            if len(component.propertyValue("PHOTO")) > config.MaxPhotoSize:
++                self.log.error("vcard photo exceeds maximum size")
++                raise HTTPError(ErrorResponse(
++                    responsecode.REQUEST_ENTITY_TOO_LARGE,
++                    (carddav_namespace, "valid-address-data"),
++                    description="vcard photo exceeds maximum size"
++                ))
++
++
+     @inlineCallbacks
+     def http_PUT(self, request):
+ 
+@@ -3409,6 +3434,7 @@ class AddressBookObjectResource(_CommonObjectResource):
+ 
+             try:
+                 component = VCard.fromString(vcarddata, format)
++                self._handleRaiseIfInvalid(component)
+             except ValueError, e:
+                 log.error(str(e))
+                 raise HTTPError(ErrorResponse(
+diff --git txdav/base/propertystore/sql.py txdav/base/propertystore/sql.py
+index 1fdd5c4..be92298 100644
+--- txdav/base/propertystore/sql.py
++++ txdav/base/propertystore/sql.py
+@@ -24,20 +24,22 @@ __all__ = [
+ ]
+ 
+ 
++from twisted.internet.defer  import Deferred
++from twistedcaldav.config    import config
+ from twistedcaldav.memcacher import Memcacher
++from txdav.idav              import PropertyChangeNotAllowedError
+ 
+ from twext.enterprise.dal.syntax import (
+     Select, Parameter, Update, Insert, TableSyntax, Delete)
+ 
+ from txdav.xml.parser import WebDAVDocument
+-from txdav.common.icommondatastore import AllRetriesFailed
++from txdav.common.icommondatastore import AllRetriesFailed, ObjectResourceTooBigError
+ from txdav.common.datastore.sql_tables import schema
+ from txdav.base.propertystore.base import (AbstractPropertyStore,
+                                            PropertyName, validKey)
+ 
+ from twisted.internet.defer import inlineCallbacks, returnValue
+ 
+-
+ prop = schema.RESOURCE_PROPERTY
+ 
+ class PropertyStore(AbstractPropertyStore):
+@@ -284,7 +286,7 @@ class PropertyStore(AbstractPropertyStore):
+                            prop.VIEWER_UID: Parameter("uid")})
+ 
+ 
+-    def _setitem_uid(self, key, value, uid):
++    def _handleSetUid(self, key, value, uid):
+         validKey(key)
+ 
+         key_str = key.toString()
+@@ -323,6 +325,28 @@ class PropertyStore(AbstractPropertyStore):
+             self.log.error("setting a property failed; probably nothing.")
+         self._txn.subtransaction(trySetItem).addErrback(justLogIt)
+ 
++
++    def _setitem_uid(self, key, value, uid):
++
++        @inlineCallbacks
++        def handleSetIfLegalPropertyCount(txn):
++            rows = yield self._allWithID.on(txn, resourceID=self._resourceID)
++            if len(rows) > config.MaxPropertiesPerResource:
++                raise PropertyChangeNotAllowedError("Resource property size exceeds maximum.", (key,))
++            else:
++                self._handleSetUid(key, value, uid)
++
++        if len(str(value)) > config.MaxPropertySize:
++            raise PropertyChangeNotAllowedError("Resource property size exceeds maximum.", (key,))
++
++        else:
++            def justLogIt(f):
++                f.trap(AllRetriesFailed)
++                self.log.error("setting a property failed; probably nothing.")
++
++            self._txn.subtransaction(handleSetIfLegalPropertyCount).addErrback(justLogIt)
++
++
+     _deleteQuery = Delete(
+         prop, Where=(prop.RESOURCE_ID == Parameter("resourceID")).And(
+             prop.NAME == Parameter("name")).And(
+diff --git txdav/carddav/datastore/sql.py txdav/carddav/datastore/sql.py
+index 9455e3a..5c99003 100644
+--- txdav/carddav/datastore/sql.py
++++ txdav/carddav/datastore/sql.py
+@@ -33,7 +33,7 @@ from twext.enterprise.locking import NamedLock
+ from twext.python.clsprop import classproperty
+ from twext.web2.http import HTTPError
+ from twext.web2.http_headers import MimeType
+-from twext.web2.responsecode import FORBIDDEN
++from twext.web2.responsecode import FORBIDDEN, REQUEST_ENTITY_TOO_LARGE
+ 
+ from twisted.internet.defer import inlineCallbacks, returnValue
+ from twisted.python import hashlib
+@@ -65,6 +65,28 @@ from uuid import uuid4
+ 
+ from zope.interface.declarations import implements
+ 
++import os
++from pycalendar.value          import Value
++from pycalendar.vcard.property import Property as RealProp
++from twext.web2.dav.http       import ErrorResponse
++
++from twistedcaldav.directory.securesync import FlockConfig
++from boto.s3.connection                 import S3Connection
++from boto.s3.key                        import Key
++
++def getKeyForPhotoPath(ownerUid, photoPath):
++    if "mnt/s3" in photoPath:
++        parts = photoPath.split("/")
++        return "/contact-photos/" + ownerUid + "/" + parts[len(parts) - 1]
++    else:
++        return None
++
++def getKeyForLegacyPhotoPath(photoPath):
++    if "mnt/s3" in photoPath:
++        parts = photoPath.split("/")
++        return "/contact-photos/" + parts[len(parts) - 1]
++    else:
++        return None
+ 
+ class AddressBookHome(CommonHome):
+ 
+@@ -398,7 +420,7 @@ class AddressBook(CommonHomeChild, AddressBookSharingMixIn):
+ 
+     def __init__(self, home, name, resourceID, mode, status, revision=0, message=None, ownerHome=None, bindName=None):
+         ownerName = ownerHome.addressbook().name() if ownerHome else None
+-        super(AddressBook, self).__init__(home, name, resourceID, mode, status, revision=revision, message=message, ownerHome=ownerHome, ownerName=ownerName)
++        super(AddressBook, self).__init__(home, name, resourceID, mode, status, revision=revision, message=message, ownerHome=ownerHome, ownerName=ownerName, maxResourcesPerCollection=config.MaxContactsPerAddressbook)
+         self._index = PostgresLegacyABIndexEmulator(self)
+         self._bindName = bindName
+ 
+@@ -1267,6 +1289,7 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+ 
+     def __init__(self, addressbook, name, uid, resourceID=None, options=None):
+ 
++        self._photoFilePath = None
+         self._kind = None
+         self._ownerAddressBookResourceID = None
+         # _self._component is the cached, current component
+@@ -1356,7 +1379,29 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+                  aboForeignMembers.MEMBER_ADDRESS: memberAddress, }
+             ).on(self._txn)
+ 
++        resourceIdSave = self._resourceID
++        photoPathSave  = self._photoFilePath
+         yield super(AddressBookObject, self).remove()
++
++        if photoPathSave is not None:
++            self.log.info("deleting photo at %s for %d " % (photoPathSave, resourceIdSave))
++
++            try:
++                connection = S3Connection(FlockConfig.S3_ACCESS_KEY, FlockConfig.S3_SECRET_KEY)
++                bucket     = connection.get_bucket(FlockConfig.S3_BUCKET_NAME, validate=False)
++
++                key     = Key(bucket)
++                key.key = getKeyForPhotoPath(self.addressbook().ownerHome().uid(), photoPathSave)
++
++                if key.exists():
++                    key.delete()
++
++                else:
++                    self.log.info("legacy key needed to delete photo at %s for %d " % (photoPathSave, resourceIdSave))
++
++            except Exception as e:
++                raise InternalDataStoreError("caught exception %s while deleting photo %s for %d" % (e, photoPathSave, resourceIdSave))
++
+         self._kind = None
+         self._ownerAddressBookResourceID = None
+         self._component = None
+@@ -1513,6 +1558,7 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+             obj.RESOURCE_ID,
+             obj.RESOURCE_NAME,
+             obj.UID,
++            obj.PHOTO,
+             obj.KIND,
+             obj.MD5,
+             Len(obj.TEXT),
+@@ -1530,6 +1576,7 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+          self._resourceID,
+          self._name,
+          self._uid,
++         self._photoFilePath,
+          self._kind,
+          self._md5,
+          self._size,
+@@ -1608,9 +1655,17 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+ 
+         # Valid data sizes
+         if config.MaxResourceSize:
+-            vcardsize = len(str(component))
++            if component.hasProperty("PHOTO"):
++                vcardsize = len(str(component)) - len(component.propertyValue("PHOTO"))
++            else:
++                vcardsize = len(str(component))
+             if vcardsize > config.MaxResourceSize:
+-                raise ObjectResourceTooBigError()
++                raise HTTPError(REQUEST_ENTITY_TOO_LARGE)
++
++        if config.MaxPhotoSize and component.hasProperty("PHOTO"):
++            if len(component.propertyValue("PHOTO")) > config.MaxPhotoSize:
++                raise HTTPError(REQUEST_ENTITY_TOO_LARGE)
++
+ 
+         # Valid calendar data checks
+         self.validAddressDataCheck(component, inserting)
+@@ -1755,6 +1810,7 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+              abo.RESOURCE_NAME: Parameter("name"),
+              abo.VCARD_TEXT: Parameter("text"),
+              abo.VCARD_UID: Parameter("uid"),
++             abo.PHOTO_FILE_PATH: Parameter("photo"),
+              abo.KIND: Parameter("kind"),
+              abo.MD5: Parameter("md5"),
+              },
+@@ -1784,6 +1840,7 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+         uid = component.resourceUID()
+         assert inserting or self._uid == uid  # can't change UID. Should be checked in upper layers
+         self._uid = uid
++
+         originalComponentText = str(component)
+ 
+         if self._kind == _ABO_KIND_GROUP:
+@@ -1847,6 +1904,51 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+         if self._txn._migrating and hasattr(component, "md5"):
+             self._md5 = component.md5
+ 
++        # Flock flock flock :D
++        if component.hasProperty("PHOTO"):
++            self._photoFilePath = "/mnt/s3/contact-photos/" + uid
++
++            if self._resourceID is not None:
++                self.log.info("saving photo for %d to %s" % (self._resourceID, self._photoFilePath))
++            else:
++                self.log.info("saving photo for new component %s to %s" % (uid, self._photoFilePath))
++
++            try:
++                connection = S3Connection(FlockConfig.S3_ACCESS_KEY, FlockConfig.S3_SECRET_KEY)
++                bucket     = connection.get_bucket(FlockConfig.S3_BUCKET_NAME, validate=False)
++
++                key     = Key(bucket)
++                key.key = getKeyForPhotoPath(self.addressbook().ownerHome().uid(), self._photoFilePath)
++                key.set_contents_from_string(component.propertyValue("PHOTO"))
++
++            except Exception as e:
++                raise InternalDataStoreError("caught exception %s while saving photo %s for %d" % (e, self._photoFilePath, self._resourceID))
++
++            component.removeProperties("PHOTO")
++
++        elif self._photoFilePath is not None:
++            deletedPhotoPath    = self._photoFilePath
++            self._photoFilePath = None
++
++            self.log.info("deleting photo at %s for %d " % (deletedPhotoPath, self._resourceID))
++
++            try:
++                # TODO: check if photo is present...
++                connection = S3Connection(FlockConfig.S3_ACCESS_KEY, FlockConfig.S3_SECRET_KEY)
++                bucket     = connection.get_bucket(FlockConfig.S3_BUCKET_NAME, validate=False)
++
++                key     = Key(bucket)
++                key.key = getKeyForPhotoPath(self.addressbook().ownerHome().uid(), deletedPhotoPath)
++
++                if key.exists():
++                    key.delete()
++
++                else:
++                    self.log.info("legacy key needed to delete photo at %s for %d " % (deletedPhotoPath, self._resourceID))
++
++            except Exception as e:
++                raise InternalDataStoreError("caught exception %s while deleting photo %s for %d" % (e, deletedPhotoPath, self._resourceID))
++
+         abo = schema.ADDRESSBOOK_OBJECT
+         aboForeignMembers = schema.ABO_FOREIGN_MEMBERS
+         aboMembers = schema.ABO_MEMBERS
+@@ -1859,6 +1961,7 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+                     name=self._name,
+                     text=self._objectText,
+                     uid=self._uid,
++                    photo=self._photoFilePath,
+                     md5=self._md5,
+                     kind=self._kind,
+                 )
+@@ -1889,6 +1992,7 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+         else:
+             self._modified = (yield Update(
+                 {abo.VCARD_TEXT: self._objectText,
++                 abo.PHOTO_FILE_PATH: self._photoFilePath,
+                  abo.MD5: self._md5,
+                  abo.MODIFIED: utcNowSQL},
+                 Where=abo.RESOURCE_ID == self._resourceID,
+@@ -1972,6 +2076,43 @@ class AddressBookObject(CommonObjectResource, AddressBookSharingMixIn):
+                         % (e, self._resourceID)
+                     )
+ 
++                # Flock flock flock :D
++                if self._photoFilePath is not None:
++                    self.log.info("reading photo at %s for %d " % (self._photoFilePath, self._resourceID))
++
++                    try:
++                        connection = S3Connection(FlockConfig.S3_ACCESS_KEY, FlockConfig.S3_SECRET_KEY)
++                        bucket     = connection.get_bucket(FlockConfig.S3_BUCKET_NAME, validate=False)
++
++                        key     = Key(bucket)
++                        key.key = getKeyForPhotoPath(self.addressbook().ownerHome().uid(), self._photoFilePath)
++
++                        if key.exists():
++                            photoText = key.get_contents_as_string()
++
++                        else:
++                            self.log.info("using legacy key for photo at %s for %d " % (self._photoFilePath, self._resourceID))
++                            key.key   = getKeyForLegacyPhotoPath(self._photoFilePath)
++                            photoText = key.get_contents_as_string()
++
++                    except Exception as e:
++                        raise InternalDataStoreError("caught exception %s while reading photo %s for %d" % (e, self._photoFilePath, self._resourceID))
++
++                    if photoText is None:
++                        raise InternalDataStoreError("error reading photo from %s for %d, photoText is None" % (self._photoFilePath, self._resourceID))
++
++                    if not photoText:
++                        raise InternalDataStoreError("error reading photo from %s for %d, photoText is empty" % (self._photoFilePath, self._resourceID))
++
++                    photoParams   = {
++                        "ENCODING"             : "b",
++                        "TYPE"                 : "jpeg",
++                        "X-FLOCK-HIDDEN-PHOTO" : "true"
++                    }
++                    photoProperty         = Property("PHOTO",      photoText,       params=photoParams)
++                    photoProperty._pycard = RealProp(name="PHOTO", value=photoText, valuetype=Value.VALUETYPE_BINARY)
++                    component.addProperty(photoProperty)
++
+                 # Fix any bogus data we can
+                 fixed, unfixed = component.validVCardData(doFix=True, doRaise=False)
+ 
+diff --git txdav/common/datastore/sql.py txdav/common/datastore/sql.py
+index 40f292c..ff8b29b 100644
+--- txdav/common/datastore/sql.py
++++ txdav/common/datastore/sql.py
+@@ -3429,7 +3429,7 @@ class CommonHomeChild(FancyEqMixin, Memoizable, _SharedSyncLogic, HomeChildBase,
+     _objectSchema = None
+ 
+ 
+-    def __init__(self, home, name, resourceID, mode, status, revision=0, message=None, ownerHome=None, ownerName=None):
++    def __init__(self, home, name, resourceID, mode, status, revision=0, message=None, ownerHome=None, ownerName=None, maxResourcesPerCollection=None):
+ 
+         self._home = home
+         self._name = name
+@@ -3445,6 +3445,10 @@ class CommonHomeChild(FancyEqMixin, Memoizable, _SharedSyncLogic, HomeChildBase,
+         self._objects = {}
+         self._objectNames = None
+         self._syncTokenRevision = None
++        if maxResourcesPerCollection is None:
++            self._maxResourcesPerCollection = config.MaxResourcesPerCollection
++        else:
++            self._maxResourcesPerCollection = maxResourcesPerCollection
+ 
+         # Always use notifiers based off the owner home so that shared collections use tokens common
+         # to the owner - and thus will be the same for each sharee. Without that, each sharee would have
+@@ -4084,9 +4088,9 @@ class CommonHomeChild(FancyEqMixin, Memoizable, _SharedSyncLogic, HomeChildBase,
+             raise ObjectResourceNameAlreadyExistsError()
+ 
+         # Apply check to the size of the collection
+-        if config.MaxResourcesPerCollection:
++        if self._maxResourcesPerCollection:
+             child_count = (yield self.countObjectResources())
+-            if child_count >= config.MaxResourcesPerCollection:
++            if child_count >= self._maxResourcesPerCollection:
+                 raise TooManyObjectResourcesError()
+ 
+         objectResource = (
+@@ -4167,9 +4171,9 @@ class CommonHomeChild(FancyEqMixin, Memoizable, _SharedSyncLogic, HomeChildBase,
+             raise ObjectResourceNameAlreadyExistsError(newname)
+ 
+         # Apply check to the size of the collection
+-        if config.MaxResourcesPerCollection:
++        if self._maxResourcesPerCollection:
+             child_count = (yield self.countObjectResources())
+-            if child_count >= config.MaxResourcesPerCollection:
++            if child_count >= self._maxResourcesPerCollection:
+                 raise TooManyObjectResourcesError()
+ 
+         # Clean this collections cache and signal sync change
+@@ -5849,4 +5853,4 @@ def fixUUIDNormalization(store):
+         # service will survive for everyone _not_ affected by this somewhat
+         # obscure bug.
+     else:
+-        yield t.commit()
++        yield t.commit()
+\ No newline at end of file
+diff --git txdav/common/datastore/sql_schema/current.sql txdav/common/datastore/sql_schema/current.sql
+index b67ce7c..6dc02e2 100644
+--- txdav/common/datastore/sql_schema/current.sql
++++ txdav/common/datastore/sql_schema/current.sql
+@@ -52,7 +52,7 @@ create table NAMED_LOCK (
+ -------------------
+ 
+ create table CALENDAR_HOME (
+-  RESOURCE_ID      integer      primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
++  RESOURCE_ID      bigint       primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
+   OWNER_UID        varchar(255) not null unique,                                 -- implicit index
+   DATAVERSION      integer      default 0 not null
+ );
+@@ -62,7 +62,7 @@ create table CALENDAR_HOME (
+ --------------
+ 
+ create table CALENDAR (
+-  RESOURCE_ID integer   primary key default nextval('RESOURCE_ID_SEQ') -- implicit index
++  RESOURCE_ID bigint   primary key default nextval('RESOURCE_ID_SEQ') -- implicit index
+ );
+ 
+ ----------------------------
+@@ -70,11 +70,11 @@ create table CALENDAR (
+ ----------------------------
+ 
+ create table CALENDAR_HOME_METADATA (
+-  RESOURCE_ID              integer     primary key references CALENDAR_HOME on delete cascade, -- implicit index
++  RESOURCE_ID              bigint      primary key references CALENDAR_HOME on delete cascade, -- implicit index
+   QUOTA_USED_BYTES         integer     default 0 not null,
+-  DEFAULT_EVENTS           integer     default null references CALENDAR on delete set null,
+-  DEFAULT_TASKS            integer     default null references CALENDAR on delete set null,
+-  DEFAULT_POLLS            integer     default null references CALENDAR on delete set null,
++  DEFAULT_EVENTS           bigint      default null references CALENDAR on delete set null,
++  DEFAULT_TASKS            bigint      default null references CALENDAR on delete set null,
++  DEFAULT_POLLS            bigint      default null references CALENDAR on delete set null,
+   ALARM_VEVENT_TIMED       text        default null,
+   ALARM_VEVENT_ALLDAY      text        default null,
+   ALARM_VTODO_TIMED        text        default null,
+@@ -96,7 +96,7 @@ create index CALENDAR_HOME_METADATA_DEFAULT_POLLS on
+ -----------------------
+ 
+ create table CALENDAR_METADATA (
+-  RESOURCE_ID           integer      primary key references CALENDAR on delete cascade, -- implicit index
++  RESOURCE_ID           bigint       primary key references CALENDAR on delete cascade, -- implicit index
+   SUPPORTED_COMPONENTS  varchar(255) default null,
+   CREATED               timestamp    default timezone('UTC', CURRENT_TIMESTAMP),
+   MODIFIED              timestamp    default timezone('UTC', CURRENT_TIMESTAMP)
+@@ -108,13 +108,13 @@ create table CALENDAR_METADATA (
+ ---------------------------
+ 
+ create table NOTIFICATION_HOME (
+-  RESOURCE_ID integer      primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
++  RESOURCE_ID bigint       primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
+   OWNER_UID   varchar(255) not null unique                                 -- implicit index
+ );
+ 
+ create table NOTIFICATION (
+-  RESOURCE_ID                   integer      primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
+-  NOTIFICATION_HOME_RESOURCE_ID integer      not null references NOTIFICATION_HOME,
++  RESOURCE_ID                   bigint       primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
++  NOTIFICATION_HOME_RESOURCE_ID bigint       not null references NOTIFICATION_HOME,
+   NOTIFICATION_UID              varchar(255) not null,
+   XML_TYPE                      varchar(255) not null,
+   XML_DATA                      text         not null,
+@@ -136,8 +136,8 @@ create index NOTIFICATION_NOTIFICATION_HOME_RESOURCE_ID on
+ -- Joins CALENDAR_HOME and CALENDAR
+ 
+ create table CALENDAR_BIND (
+-  CALENDAR_HOME_RESOURCE_ID integer      not null references CALENDAR_HOME,
+-  CALENDAR_RESOURCE_ID      integer      not null references CALENDAR on delete cascade,
++  CALENDAR_HOME_RESOURCE_ID bigint       not null references CALENDAR_HOME,
++  CALENDAR_RESOURCE_ID      bigint       not null references CALENDAR on delete cascade,
+   CALENDAR_RESOURCE_NAME    varchar(255) not null,
+   BIND_MODE                 integer      not null, -- enum CALENDAR_BIND_MODE
+   BIND_STATUS               integer      not null, -- enum CALENDAR_BIND_STATUS
+@@ -198,8 +198,8 @@ insert into CALENDAR_TRANSP values (1, 'transparent');
+ ---------------------
+ 
+ create table CALENDAR_OBJECT (
+-  RESOURCE_ID          integer      primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
+-  CALENDAR_RESOURCE_ID integer      not null references CALENDAR on delete cascade,
++  RESOURCE_ID          bigint       primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
++  CALENDAR_RESOURCE_ID bigint       not null references CALENDAR on delete cascade,
+   RESOURCE_NAME        varchar(255) not null,
+   ICALENDAR_TEXT       text         not null,
+   ICALENDAR_UID        varchar(255) not null,
+@@ -277,9 +277,9 @@ create sequence INSTANCE_ID_SEQ;
+ ----------------
+ 
+ create table TIME_RANGE (
+-  INSTANCE_ID                 integer        primary key default nextval('INSTANCE_ID_SEQ'), -- implicit index
+-  CALENDAR_RESOURCE_ID        integer        not null references CALENDAR on delete cascade,
+-  CALENDAR_OBJECT_RESOURCE_ID integer        not null references CALENDAR_OBJECT on delete cascade,
++  INSTANCE_ID                 bigint         primary key default nextval('INSTANCE_ID_SEQ'), -- implicit index
++  CALENDAR_RESOURCE_ID        bigint         not null references CALENDAR on delete cascade,
++  CALENDAR_OBJECT_RESOURCE_ID bigint         not null references CALENDAR_OBJECT on delete cascade,
+   FLOATING                    boolean        not null,
+   START_DATE                  timestamp      not null,
+   END_DATE                    timestamp      not null,
+@@ -312,7 +312,7 @@ insert into FREE_BUSY_TYPE values (4, 'busy-tentative'  );
+ ------------------
+ 
+ create table TRANSPARENCY (
+-  TIME_RANGE_INSTANCE_ID      integer      not null references TIME_RANGE on delete cascade,
++  TIME_RANGE_INSTANCE_ID      bigint       not null references TIME_RANGE on delete cascade,
+   USER_ID                     varchar(255) not null,
+   TRANSPARENT                 boolean      not null
+ );
+@@ -328,8 +328,8 @@ create index TRANSPARENCY_TIME_RANGE_INSTANCE_ID on
+ create sequence ATTACHMENT_ID_SEQ;
+ 
+ create table ATTACHMENT (
+-  ATTACHMENT_ID               integer           primary key default nextval('ATTACHMENT_ID_SEQ'), -- implicit index
+-  CALENDAR_HOME_RESOURCE_ID   integer           not null references CALENDAR_HOME,
++  ATTACHMENT_ID               bigint            primary key default nextval('ATTACHMENT_ID_SEQ'), -- implicit index
++  CALENDAR_HOME_RESOURCE_ID   bigint            not null references CALENDAR_HOME,
+   DROPBOX_ID                  varchar(255),
+   CONTENT_TYPE                varchar(255)      not null,
+   SIZE                        integer           not null,
+@@ -344,9 +344,9 @@ create index ATTACHMENT_CALENDAR_HOME_RESOURCE_ID on
+ 
+ -- Many-to-many relationship between attachments and calendar objects
+ create table ATTACHMENT_CALENDAR_OBJECT (
+-  ATTACHMENT_ID                  integer      not null references ATTACHMENT on delete cascade,
++  ATTACHMENT_ID                  bigint       not null references ATTACHMENT on delete cascade,
+   MANAGED_ID                     varchar(255) not null,
+-  CALENDAR_OBJECT_RESOURCE_ID    integer      not null references CALENDAR_OBJECT on delete cascade,
++  CALENDAR_OBJECT_RESOURCE_ID    bigint       not null references CALENDAR_OBJECT on delete cascade,
+ 
+   primary key (ATTACHMENT_ID, CALENDAR_OBJECT_RESOURCE_ID), -- implicit index
+   unique (MANAGED_ID, CALENDAR_OBJECT_RESOURCE_ID) --implicit index
+@@ -360,7 +360,7 @@ create index ATTACHMENT_CALENDAR_OBJECT_CALENDAR_OBJECT_RESOURCE_ID on
+ -----------------------
+ 
+ create table RESOURCE_PROPERTY (
+-  RESOURCE_ID integer      not null, -- foreign key: *.RESOURCE_ID
++  RESOURCE_ID bigint       not null, -- foreign key: *.RESOURCE_ID
+   NAME        varchar(255) not null,
+   VALUE       text         not null, -- FIXME: xml?
+   VIEWER_UID  varchar(255),
+@@ -374,8 +374,8 @@ create table RESOURCE_PROPERTY (
+ ----------------------
+ 
+ create table ADDRESSBOOK_HOME (
+-  RESOURCE_ID      				integer			primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
+-  ADDRESSBOOK_PROPERTY_STORE_ID	integer      	default nextval('RESOURCE_ID_SEQ') not null, 	-- implicit index
++  RESOURCE_ID      				bigint          primary key default nextval('RESOURCE_ID_SEQ'), -- implicit index
++  ADDRESSBOOK_PROPERTY_STORE_ID                bigint      	default nextval('RESOURCE_ID_SEQ') not null, 	-- implicit index
+   OWNER_UID        				varchar(255) 	not null unique,                                -- implicit index
+   DATAVERSION      				integer      	default 0 not null
+ );
+@@ -386,7 +386,7 @@ create table ADDRESSBOOK_HOME (
+ -------------------------------
+ 
+ create table ADDRESSBOOK_HOME_METADATA (
+-  RESOURCE_ID      integer      primary key references ADDRESSBOOK_HOME on delete cascade, -- implicit index
++  RESOURCE_ID      bigint       primary key references ADDRESSBOOK_HOME on delete cascade, -- implicit index
+   QUOTA_USED_BYTES integer      default 0 not null,
+   CREATED          timestamp    default timezone('UTC', CURRENT_TIMESTAMP),
+   MODIFIED         timestamp    default timezone('UTC', CURRENT_TIMESTAMP)
+@@ -400,8 +400,8 @@ create table ADDRESSBOOK_HOME_METADATA (
+ -- Joins sharee ADDRESSBOOK_HOME and owner ADDRESSBOOK_HOME
+ 
+ create table SHARED_ADDRESSBOOK_BIND (
+-  ADDRESSBOOK_HOME_RESOURCE_ID			integer			not null references ADDRESSBOOK_HOME,
+-  OWNER_HOME_RESOURCE_ID    			integer      	not null references ADDRESSBOOK_HOME on delete cascade,
++  ADDRESSBOOK_HOME_RESOURCE_ID			bigint		not null references ADDRESSBOOK_HOME,
++  OWNER_HOME_RESOURCE_ID    			bigint      	not null references ADDRESSBOOK_HOME on delete cascade,
+   ADDRESSBOOK_RESOURCE_NAME    			varchar(255) 	not null,
+   BIND_MODE                    			integer      	not null,	-- enum CALENDAR_BIND_MODE
+   BIND_STATUS                  			integer      	not null,	-- enum CALENDAR_BIND_STATUS
+@@ -421,15 +421,16 @@ create index SHARED_ADDRESSBOOK_BIND_RESOURCE_ID on
+ ------------------------
+ 
+ create table ADDRESSBOOK_OBJECT (
+-  RESOURCE_ID             		integer   		primary key default nextval('RESOURCE_ID_SEQ'),    -- implicit index
+-  ADDRESSBOOK_HOME_RESOURCE_ID 	integer      	not null references ADDRESSBOOK_HOME on delete cascade,
+-  RESOURCE_NAME           		varchar(255) 	not null,
+-  VCARD_TEXT              		text         	not null,
+-  VCARD_UID               		varchar(255) 	not null,
+-  KIND 			  		  		integer      	not null,  -- enum ADDRESSBOOK_OBJECT_KIND
+-  MD5                     		char(32)     	not null,
+-  CREATED                 		timestamp    	default timezone('UTC', CURRENT_TIMESTAMP),
+-  MODIFIED                		timestamp    	default timezone('UTC', CURRENT_TIMESTAMP),
++  RESOURCE_ID                  bigint        primary key default nextval('RESOURCE_ID_SEQ'),    -- implicit index
++  ADDRESSBOOK_HOME_RESOURCE_ID bigint        not null references ADDRESSBOOK_HOME on delete cascade,
++  RESOURCE_NAME                varchar(255)  not null,
++  VCARD_TEXT                   text          not null,
++  PHOTO_FILE_PATH              varchar(1024),
++  VCARD_UID                    varchar(255)  not null,
++  KIND                         integer       not null,  -- enum ADDRESSBOOK_OBJECT_KIND
++  MD5                          char(32)      not null,
++  CREATED                      timestamp     default timezone('UTC', CURRENT_TIMESTAMP),
++  MODIFIED                     timestamp     default timezone('UTC', CURRENT_TIMESTAMP),
+ 
+   unique (ADDRESSBOOK_HOME_RESOURCE_ID, RESOURCE_NAME), -- implicit index
+   unique (ADDRESSBOOK_HOME_RESOURCE_ID, VCARD_UID)      -- implicit index
+@@ -456,9 +457,9 @@ insert into ADDRESSBOOK_OBJECT_KIND values (3, 'location');
+ ---------------------------------
+ 
+ create table ABO_MEMBERS (
+-    GROUP_ID              integer      not null references ADDRESSBOOK_OBJECT on delete cascade,	-- AddressBook Object's (kind=='group') RESOURCE_ID
+- 	ADDRESSBOOK_ID		  integer      not null references ADDRESSBOOK_HOME on delete cascade,
+-    MEMBER_ID             integer      not null references ADDRESSBOOK_OBJECT,						-- member AddressBook Object's RESOURCE_ID
++    GROUP_ID              bigint      not null references ADDRESSBOOK_OBJECT on delete cascade,	-- AddressBook Object's (kind=='group') RESOURCE_ID
++ 	ADDRESSBOOK_ID		  bigint      not null references ADDRESSBOOK_HOME on delete cascade,
++    MEMBER_ID             bigint      not null references ADDRESSBOOK_OBJECT,						-- member AddressBook Object's RESOURCE_ID
+ 
+     primary key (GROUP_ID, MEMBER_ID) -- implicit index
+ );
+@@ -473,8 +474,8 @@ create index ABO_MEMBERS_MEMBER_ID on
+ ------------------------------------------
+ 
+ create table ABO_FOREIGN_MEMBERS (
+-    GROUP_ID              integer      not null references ADDRESSBOOK_OBJECT on delete cascade,	-- AddressBook Object's (kind=='group') RESOURCE_ID
+- 	ADDRESSBOOK_ID		  integer      not null references ADDRESSBOOK_HOME on delete cascade,
++    GROUP_ID              bigint      not null references ADDRESSBOOK_OBJECT on delete cascade,	-- AddressBook Object's (kind=='group') RESOURCE_ID
++ 	ADDRESSBOOK_ID		  bigint      not null references ADDRESSBOOK_HOME on delete cascade,
+     MEMBER_ADDRESS  	  varchar(255) not null, 													-- member AddressBook Object's 'calendar' address
+ 
+     primary key (GROUP_ID, MEMBER_ADDRESS) -- implicit index
+@@ -490,8 +491,8 @@ create index ABO_FOREIGN_MEMBERS_ADDRESSBOOK_ID on
+ -- Joins ADDRESSBOOK_HOME and ADDRESSBOOK_OBJECT (kind == group)
+ 
+ create table SHARED_GROUP_BIND (	
+-  ADDRESSBOOK_HOME_RESOURCE_ID 		integer      not null references ADDRESSBOOK_HOME,
+-  GROUP_RESOURCE_ID      			integer      not null references ADDRESSBOOK_OBJECT on delete cascade,
++  ADDRESSBOOK_HOME_RESOURCE_ID 		bigint      not null references ADDRESSBOOK_HOME,
++  GROUP_RESOURCE_ID      			bigint      not null references ADDRESSBOOK_OBJECT on delete cascade,
+   GROUP_ADDRESSBOOK_NAME			varchar(255) not null,
+   BIND_MODE                    		integer      not null, -- enum CALENDAR_BIND_MODE
+   BIND_STATUS                  		integer      not null, -- enum CALENDAR_BIND_STATUS
+@@ -518,11 +519,11 @@ create sequence REVISION_SEQ;
+ -------------------------------
+ 
+ create table CALENDAR_OBJECT_REVISIONS (
+-  CALENDAR_HOME_RESOURCE_ID integer      not null references CALENDAR_HOME,
+-  CALENDAR_RESOURCE_ID      integer      references CALENDAR,
++  CALENDAR_HOME_RESOURCE_ID bigint       not null references CALENDAR_HOME,
++  CALENDAR_RESOURCE_ID      bigint       references CALENDAR,
+   CALENDAR_NAME             varchar(255) default null,
+   RESOURCE_NAME             varchar(255),
+-  REVISION                  integer      default nextval('REVISION_SEQ') not null,
++  REVISION                  bigint       default nextval('REVISION_SEQ') not null,
+   DELETED                   boolean      not null
+ );
+ 
+@@ -541,11 +542,11 @@ create index CALENDAR_OBJECT_REVISIONS_RESOURCE_ID_REVISION
+ ----------------------------------
+ 
+ create table ADDRESSBOOK_OBJECT_REVISIONS (
+-  ADDRESSBOOK_HOME_RESOURCE_ID 			integer			not null references ADDRESSBOOK_HOME,
+-  OWNER_HOME_RESOURCE_ID    			integer     	references ADDRESSBOOK_HOME,
++  ADDRESSBOOK_HOME_RESOURCE_ID 			bigint			not null references ADDRESSBOOK_HOME,
++  OWNER_HOME_RESOURCE_ID    			bigint     	references ADDRESSBOOK_HOME,
+   ADDRESSBOOK_NAME             			varchar(255) 	default null,
+   RESOURCE_NAME                			varchar(255),
+-  REVISION                     			integer     	default nextval('REVISION_SEQ') not null,
++  REVISION                     			bigint     	default nextval('REVISION_SEQ') not null,
+   DELETED                      			boolean      	not null
+ );
+ 
+@@ -564,9 +565,9 @@ create index ADDRESSBOOK_OBJECT_REVISIONS_OWNER_HOME_RESOURCE_ID_REVISION
+ -----------------------------------
+ 
+ create table NOTIFICATION_OBJECT_REVISIONS (
+-  NOTIFICATION_HOME_RESOURCE_ID integer      not null references NOTIFICATION_HOME on delete cascade,
++  NOTIFICATION_HOME_RESOURCE_ID bigint      not null references NOTIFICATION_HOME on delete cascade,
+   RESOURCE_NAME                 varchar(255),
+-  REVISION                      integer      default nextval('REVISION_SEQ') not null,
++  REVISION                      bigint       default nextval('REVISION_SEQ') not null,
+   DELETED                       boolean      not null,
+ 
+   unique(NOTIFICATION_HOME_RESOURCE_ID, RESOURCE_NAME) -- implicit index
+@@ -625,7 +626,7 @@ create sequence WORKITEM_SEQ;
+ ---------------------------
+ 
+ create table IMIP_INVITATION_WORK (
+-  WORK_ID                       integer      primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
++  WORK_ID                       bigint      primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
+   NOT_BEFORE                    timestamp    default timezone('UTC', CURRENT_TIMESTAMP),
+   FROM_ADDR                     varchar(255) not null,
+   TO_ADDR                       varchar(255) not null,
+@@ -638,7 +639,7 @@ create table IMIP_INVITATION_WORK (
+ -----------------------
+ 
+ create table IMIP_POLLING_WORK (
+-  WORK_ID                       integer      primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
++  WORK_ID                       bigint       primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
+   NOT_BEFORE                    timestamp    default timezone('UTC', CURRENT_TIMESTAMP)
+ );
+ 
+@@ -648,7 +649,7 @@ create table IMIP_POLLING_WORK (
+ ---------------------
+ 
+ create table IMIP_REPLY_WORK (
+-  WORK_ID                       integer      primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
++  WORK_ID                       bigint       primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
+   NOT_BEFORE                    timestamp    default timezone('UTC', CURRENT_TIMESTAMP),
+   ORGANIZER                     varchar(255) not null,
+   ATTENDEE                      varchar(255) not null,
+@@ -661,7 +662,7 @@ create table IMIP_REPLY_WORK (
+ ------------------------
+ 
+ create table PUSH_NOTIFICATION_WORK (
+-  WORK_ID                       integer      primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
++  WORK_ID                       bigint       primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
+   NOT_BEFORE                    timestamp    default timezone('UTC', CURRENT_TIMESTAMP),
+   PUSH_ID                       varchar(255) not null,
+   PRIORITY                      integer      not null -- 1:low 5:medium 10:high
+@@ -672,7 +673,7 @@ create table PUSH_NOTIFICATION_WORK (
+ -----------------
+ 
+ create table GROUP_CACHER_POLLING_WORK (
+-  WORK_ID                       integer      primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
++  WORK_ID                       bigint       primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
+   NOT_BEFORE                    timestamp    default timezone('UTC', CURRENT_TIMESTAMP)
+ );
+ 
+@@ -682,9 +683,9 @@ create table GROUP_CACHER_POLLING_WORK (
+ --------------------------
+ 
+ create table CALENDAR_OBJECT_SPLITTER_WORK (
+-  WORK_ID                       integer      primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
++  WORK_ID                       bigint       primary key default nextval('WORKITEM_SEQ') not null, -- implicit index
+   NOT_BEFORE                    timestamp    default timezone('UTC', CURRENT_TIMESTAMP),
+-  RESOURCE_ID                   integer      not null references CALENDAR_OBJECT on delete cascade
++  RESOURCE_ID                   bigint       not null references CALENDAR_OBJECT on delete cascade
+ );
+ 
+ create index CALENDAR_OBJECT_SPLITTER_WORK_RESOURCE_ID on
+diff --git txdav/common/datastore/sql_tables.py txdav/common/datastore/sql_tables.py
+index 36fea3e..0c9e49c 100644
+--- txdav/common/datastore/sql_tables.py
++++ txdav/common/datastore/sql_tables.py
+@@ -81,6 +81,7 @@ schema.CALENDAR_OBJECT.PARENT_RESOURCE_ID = schema.CALENDAR_OBJECT.CALENDAR_RESO
+ 
+ schema.ADDRESSBOOK_OBJECT.TEXT = schema.ADDRESSBOOK_OBJECT.VCARD_TEXT
+ schema.ADDRESSBOOK_OBJECT.UID = schema.ADDRESSBOOK_OBJECT.VCARD_UID
++schema.ADDRESSBOOK_OBJECT.PHOTO = schema.ADDRESSBOOK_OBJECT.PHOTO_FILE_PATH
+ schema.ADDRESSBOOK_OBJECT.PARENT_RESOURCE_ID = schema.ADDRESSBOOK_OBJECT.ADDRESSBOOK_HOME_RESOURCE_ID
+ 
+ 
