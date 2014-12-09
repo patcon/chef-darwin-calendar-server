@@ -14,6 +14,8 @@ subversion git python-pip}.each do |pkg|
   end
 end
 
+package "curl"
+
 bash "install_python_statsd" do
   user "root"
   code <<-EOH
