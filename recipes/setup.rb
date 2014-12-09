@@ -29,14 +29,24 @@ user node['darwin']['user'] do
   home     node['darwin']['home_dir']
 end
 
-directory node['darwin']['install_dir'] do
-  owner  node['darwin']['user']
-  mode   755
-  action :create
+# SVN can't deal well with untracked dirs/files, so remove manually each time
+directory "#{node['darwin']['install_dir']}/twistedcaldav/directory/securesync" do
+  action :delete
+  recursive true
+end
+
+subversion "CalendarServer" do
+  repository "http://svn.calendarserver.org/repository/calendarserver/CalendarServer/trunk"
+  revision "11995"
+  user node['darwin']['user']
+  group node['darwin']['user']
+  destination node['darwin']['install_dir']
+  action :force_export
 end
 
 directory node['darwin']['server_root'] do
   owner  node['darwin']['user']
-  mode   755
+  group  node['darwin']['user']
+  mode   "0755"
   action :create
 end
