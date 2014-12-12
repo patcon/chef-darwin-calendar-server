@@ -87,8 +87,12 @@ bash "create-postgres-user" do
   code "psql < /tmp/create-postgres-user.sql"
 end
 
+bash "populate-db-schema" do
+  user node['darwin']['user']
+  code "psql -d #{db_name} < #{node['darwin']['install_dir']}/txdav/common/datastore/sql_schema/current.sql"
+end
+
 service "caldavd" do
   provider Chef::Provider::Service::Upstart
   action [:restart]
 end
-
