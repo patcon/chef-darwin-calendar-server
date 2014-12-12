@@ -92,6 +92,8 @@ bash "populate-db-schema" do
   code "psql -d #{db_name} < #{node['darwin']['install_dir']}/txdav/common/datastore/sql_schema/current.sql"
 end
 
+package "memcached"
+
 service "caldavd" do
   provider Chef::Provider::Service::Upstart
   action [:restart]
