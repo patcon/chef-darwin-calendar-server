@@ -41,7 +41,7 @@ subversion "CalendarServer" do
   user node['darwin']['user']
   group node['darwin']['user']
   destination node['darwin']['install_dir']
-  action :force_export
+  action :sync
 end
 
 directory node['darwin']['server_root'] do
