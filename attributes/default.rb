@@ -4,5 +4,6 @@ default['darwin']['home_dir']        = "/home/#{default['darwin']['user']}"
 default['darwin']['install_dir']     = "#{default['darwin']['home_dir']}/CalendarServer"
 default['darwin']['server_root']     = "#{default['darwin']['install_dir']}/data"
 default['darwin']['directory_service'] = "twistedcaldav.directory.securesync.PsqlDirectoryService.PsqlDirectoryService"
+default['darwin']['webdav_users']    = []
 default['darwin']['config_file']     = "#{default['darwin']['install_dir']}/conf/caldavd.plist"
 default['darwin']['caldavd_options'] = "-f #{default['darwin']['config_file']}"

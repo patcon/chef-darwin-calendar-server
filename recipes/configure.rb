@@ -20,4 +20,5 @@ template "#{node['darwin']['server_root']}/Data/accounts.xml" do
   owner  node['darwin']['user']
   mode   0755
   source 'accounts.xml.erb'
+  helpers(Opscode::CalendarServerHelpers)
 end
